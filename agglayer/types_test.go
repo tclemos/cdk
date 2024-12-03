@@ -17,7 +17,7 @@ const (
 
 func TestMGenericPPError(t *testing.T) {
 	err := GenericPPError{"test", "value"}
-	require.Equal(t, "Generic error: test: value", err.String())
+	require.Equal(t, "Generic error: test: value", err.Error())
 }
 
 func TestCertificateHeaderID(t *testing.T) {
@@ -287,6 +287,6 @@ func TestUnmarshalCertificateHeaderUnknownError(t *testing.T) {
 	err := json.Unmarshal(data, &result)
 	require.NoError(t, err)
 	require.NotNil(t, result)
-	ppError := result.Error.String()
+	ppError := result.Error
 	require.Equal(t, `Generic error: ProofVerificationFailed: {"Plonk":"the verifying key does not match the inner plonk bn254 proof's committed verifying key"}`, ppError)
 }
