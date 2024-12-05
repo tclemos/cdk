@@ -715,7 +715,7 @@ func convertNumeric(value float64, targetType reflect.Type) (interface{}, error)
 	case reflect.Float64:
 		return value, nil
 	default:
-		return nil, errors.New("unsupported target type")
+		return nil, fmt.Errorf("unsupported target type %v", targetType)
 	}
 }
 
