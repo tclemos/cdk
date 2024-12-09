@@ -2,7 +2,6 @@ package l1infotreesync_test
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math/big"
 	"path"
@@ -14,8 +13,11 @@ import (
 	cdktypes "github.com/0xPolygon/cdk/config/types"
 	"github.com/0xPolygon/cdk/etherman"
 	"github.com/0xPolygon/cdk/l1infotreesync"
+	mocks_l1infotreesync "github.com/0xPolygon/cdk/l1infotreesync/mocks"
+	"github.com/0xPolygon/cdk/log"
 	"github.com/0xPolygon/cdk/reorgdetector"
 	"github.com/0xPolygon/cdk/test/contracts/verifybatchesmock"
+	"github.com/0xPolygon/cdk/test/helpers"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -25,64 +27,49 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func newSimulatedClient(auth *bind.TransactOpts) (
-	client *simulated.Backend,
-	gerAddr common.Address,
-	verifyAddr common.Address,
-	gerContract *polygonzkevmglobalexitrootv2.Polygonzkevmglobalexitrootv2,
-	verifyContract *verifybatchesmock.Verifybatchesmock,
-	err error,
+func newSimulatedClient(t *testing.T) (
+	*simulated.Backend,
+	*bind.TransactOpts,
+	common.Address,
+	common.Address,
+	*polygonzkevmglobalexitrootv2.Polygonzkevmglobalexitrootv2,
+	*verifybatchesmock.Verifybatchesmock,
 ) {
+	t.Helper()
+
 	ctx := context.Background()
-	balance, _ := new(big.Int).SetString("10000000000000000000000000", 10)
-	address := auth.From
-	genesisAlloc := map[common.Address]types.Account{
-		address: {
-			Balance: balance,
-		},
-	}
-	blockGasLimit := uint64(999999999999999999)
-	client = simulated.NewBackend(genesisAlloc, simulated.WithBlockGasLimit(blockGasLimit))
+	client, setup := helpers.SimulatedBackend(t, nil, 0)
 
-	nonce, err := client.Client().PendingNonceAt(ctx, auth.From)
-	if err != nil {
-		return
-	}
-	precalculatedAddr := crypto.CreateAddress(auth.From, nonce+1)
-	verifyAddr, _, verifyContract, err = verifybatchesmock.DeployVerifybatchesmock(auth, client.Client(), precalculatedAddr)
-	if err != nil {
-		return
-	}
+	nonce, err := client.Client().PendingNonceAt(ctx, setup.UserAuth.From)
+	require.NoError(t, err)
+
+	precalculatedAddr := crypto.CreateAddress(setup.UserAuth.From, nonce+1)
+	verifyAddr, _, verifyContract, err := verifybatchesmock.DeployVerifybatchesmock(setup.UserAuth, client.Client(), precalculatedAddr)
+	require.NoError(t, err)
 	client.Commit()
 
-	gerAddr, _, gerContract, err = polygonzkevmglobalexitrootv2.DeployPolygonzkevmglobalexitrootv2(auth, client.Client(), verifyAddr, auth.From)
-	if err != nil {
-		return
-	}
+	gerAddr, _, gerContract, err := polygonzkevmglobalexitrootv2.DeployPolygonzkevmglobalexitrootv2(setup.UserAuth, client.Client(), verifyAddr, setup.UserAuth.From)
+	require.NoError(t, err)
 	client.Commit()
 
-	if precalculatedAddr != gerAddr {
-		err = errors.New("error calculating addr")
-	}
+	require.Equal(t, precalculatedAddr, gerAddr)
 
-	return
+	return client, setup.UserAuth, gerAddr, verifyAddr, gerContract, verifyContract
 }
 
 func TestE2E(t *testing.T) {
-	ctx := context.Background()
-	dbPath := path.Join(t.TempDir(), "file::memory:?cache=shared")
-	privateKey, err := crypto.GenerateKey()
-	require.NoError(t, err)
-	auth, err := bind.NewKeyedTransactorWithChainID(privateKey, big.NewInt(1337))
-	require.NoError(t, err)
-	rdm := l1infotreesync.NewReorgDetectorMock(t)
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	dbPath := path.Join(t.TempDir(), "L1InfoTreeTest.sqlite")
+
+	rdm := mocks_l1infotreesync.NewReorgDetectorMock(t)
 	rdm.On("Subscribe", mock.Anything).Return(&reorgdetector.Subscription{}, nil)
 	rdm.On("AddBlockToTrack", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
-	client, gerAddr, verifyAddr, gerSc, verifySC, err := newSimulatedClient(auth)
-	require.NoError(t, err)
+
+	client, auth, gerAddr, verifyAddr, gerSc, verifySC := newSimulatedClient(t)
 	syncer, err := l1infotreesync.New(ctx, dbPath, gerAddr, verifyAddr, 10, etherman.LatestBlock, rdm, client.Client(), time.Millisecond, 0, 100*time.Millisecond, 3,
 		l1infotreesync.FlagAllowWrongContractsAddrs)
 	require.NoError(t, err)
+
 	go syncer.Start(ctx)
 
 	// Update GER 3 times
@@ -112,6 +99,11 @@ func TestE2E(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, common.Hash(expectedRoot), actualRoot.Hash)
 	}
+
+	// Restart syncer
+	cancelCtx()
+	ctx = context.Background()
+	go syncer.Start(ctx)
 
 	// Update 3 rollups (verify batches event) 3 times
 	for rollupID := uint32(1); rollupID < 3; rollupID++ {
@@ -164,16 +156,14 @@ func TestE2E(t *testing.T) {
 func TestWithReorgs(t *testing.T) {
 	ctx := context.Background()
 	dbPathSyncer := path.Join(t.TempDir(), "file::memory:?cache=shared")
-	dbPathReorg := t.TempDir()
-	privateKey, err := crypto.GenerateKey()
-	require.NoError(t, err)
-	auth, err := bind.NewKeyedTransactorWithChainID(privateKey, big.NewInt(1337))
-	require.NoError(t, err)
-	client, gerAddr, verifyAddr, gerSc, verifySC, err := newSimulatedClient(auth)
-	require.NoError(t, err)
+	dbPathReorg := path.Join(t.TempDir(), "file::memory:?cache=shared")
+
+	client, auth, gerAddr, verifyAddr, gerSc, verifySC := newSimulatedClient(t)
+
 	rd, err := reorgdetector.New(client.Client(), reorgdetector.Config{DBPath: dbPathReorg, CheckReorgsInterval: cdktypes.NewDuration(time.Millisecond * 30)})
 	require.NoError(t, err)
 	require.NoError(t, rd.Start(ctx))
+
 	syncer, err := l1infotreesync.New(ctx, dbPathSyncer, gerAddr, verifyAddr, 10, etherman.LatestBlock, rd, client.Client(), time.Millisecond, 0, time.Second, 25,
 		l1infotreesync.FlagAllowWrongContractsAddrs)
 	require.NoError(t, err)
@@ -192,12 +182,12 @@ func TestWithReorgs(t *testing.T) {
 
 		// Update L1 Info Tree + Rollup Exit Tree
 		newLocalExitRoot := common.HexToHash(strconv.Itoa(i) + "ffff" + strconv.Itoa(1))
-		_, err = verifySC.VerifyBatches(auth, rollupID, 0, newLocalExitRoot, common.Hash{}, true)
+		_, err = verifySC.VerifyBatchesTrustedAggregator(auth, rollupID, 0, newLocalExitRoot, common.Hash{}, true)
 		require.NoError(t, err)
 
 		// Update Rollup Exit Tree
 		newLocalExitRoot = common.HexToHash(strconv.Itoa(i) + "ffff" + strconv.Itoa(2))
-		_, err = verifySC.VerifyBatches(auth, rollupID, 0, newLocalExitRoot, common.Hash{}, false)
+		_, err = verifySC.VerifyBatchesTrustedAggregator(auth, rollupID, 0, newLocalExitRoot, common.Hash{}, false)
 		require.NoError(t, err)
 	}
 
@@ -284,16 +274,14 @@ func TestStressAndReorgs(t *testing.T) {
 
 	ctx := context.Background()
 	dbPathSyncer := path.Join(t.TempDir(), "file:TestStressAndReorgs:memory:?cache=shared")
-	dbPathReorg := t.TempDir()
-	privateKey, err := crypto.GenerateKey()
-	require.NoError(t, err)
-	auth, err := bind.NewKeyedTransactorWithChainID(privateKey, big.NewInt(1337))
-	require.NoError(t, err)
-	client, gerAddr, verifyAddr, gerSc, verifySC, err := newSimulatedClient(auth)
-	require.NoError(t, err)
+	dbPathReorg := path.Join(t.TempDir(), "file::memory:?cache=shared")
+
+	client, auth, gerAddr, verifyAddr, gerSc, verifySC := newSimulatedClient(t)
+
 	rd, err := reorgdetector.New(client.Client(), reorgdetector.Config{DBPath: dbPathReorg, CheckReorgsInterval: cdktypes.NewDuration(time.Millisecond * 100)})
 	require.NoError(t, err)
 	require.NoError(t, rd.Start(ctx))
+
 	syncer, err := l1infotreesync.New(ctx, dbPathSyncer, gerAddr, verifyAddr, 10, etherman.LatestBlock, rd, client.Client(), time.Millisecond, 0, time.Second, 100,
 		l1infotreesync.FlagAllowWrongContractsAddrs)
 	require.NoError(t, err)
@@ -324,6 +312,7 @@ func TestStressAndReorgs(t *testing.T) {
 				require.NoError(t, err)
 
 				block, err := client.Client().BlockByNumber(ctx, big.NewInt(int64(currentBlockNum-reorgSizeInBlocks)))
+				log.Debugf("reorging until block %d. Current block %d (before reorg)", block.NumberU64(), currentBlockNum)
 				require.NoError(t, err)
 				reorgFrom := block.Hash()
 				err = client.Fork(reorgFrom)
